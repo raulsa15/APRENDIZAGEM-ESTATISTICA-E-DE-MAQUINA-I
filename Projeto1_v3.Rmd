@@ -1,0 +1,333 @@
+---
+title: "Integrador1"
+output: html_document
+editor_options: 
+chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+##bibliotecas
+
+```{r}
+library(tidyverse)
+library(rsample)
+library(skimr)
+library(rpart)
+library(rpart.plot)
+library(modeldata)
+library(glmnet)
+library(plotmo)
+library(glmnet)
+library(partykit)
+library(GGally)
+library(ranger)
+library(pROC)
+library(janitor)
+library(tidymodels)
+library(vip)
+library(gbm)
+library(xgboost)
+library(randomForest)
+library(mlbench)
+library(caret)
+library(pdp)
+library(gridExtra)
+```
+
+## Base
+
+```{r}
+dados <- read.csv('resultados.csv', encoding = "UTF-8", row.names = "comp_id") %>% clean_names()
+```
+
+
+#tratando a base
+
+```{r}
+
+
+dados[,c('x','balsheet_flag', 'balsheet_length', 'balsheet_notfullyear','nace_main','ind','founded_date')] <- list(NULL)
+
+names <- c('gender', 'origin', 'ind2', 'urban_m', 'region_m', 'default')
+dados[,names] <- lapply(dados[,names] , factor)
+
+dados$ind2 <- dados$ind2 %>% fct_lump(prop = .05)
+
+dados[dados==""]<-NA
+
+dados <- dados %>% 
+  mutate_if(is.numeric, function(x) ifelse(is.na(x), median(x, na.rm = T), x))
+
+skim(dados)
+```
+
+#retirando os NAs dos fatores
+
+```{r}
+replace_factor_na <- function(x){
+  x <- as.character(x)
+  x <- if_else(is.na(x), "None", x)
+  x <- as.factor(x)
+}
+
+dados <- dados %>%
+  mutate_if(is.factor, replace_factor_na)
+
+skim(dados)
+```
+
+#conjuntos treinamento e teste
+
+```{r}
+set.seed(1234)
+
+splits <- initial_split(dados, prop = .8, strata = "default")
+
+tr <- training(splits)
+teste <- testing(splits)
+
+```
+
+#Colocando no formato matriz para o GLMNET
+
+```{r}
+X <- model.matrix(default~., data = dados)[,-1]
+Y <- dados$default
+
+X_tr <- model.matrix(default~., data = tr)[,-1]
+X_teste <- model.matrix(default~., data = teste)[,-1]
+
+y_tr <- tr$default
+Y_teste <- teste$default
+```
+
+#tabela de resultados
+
+```{r}
+tab_AUC <- tibble(metodo = c("log", "ridge", "lasso", "árvore", "forest"), 
+              AUC = NA)
+
+```
+
+#regressão logística
+
+```{r}
+fit_log <- glm(default ~., family = "binomial", data = tr)
+
+prob_log <- predict(fit_log, teste, type = "response")
+
+roc_log <- roc(teste$default, prob_log)
+
+plot(roc_log, legacy.axes = TRUE)
+
+vip(fit_log, aesthetics = list(fill = "gold"))
+
+tab_AUC$AUC[tab_AUC$metodo == "log"] <- roc_log$auc
+tab_AUC
+
+```
+
+#ridge
+
+```{r}
+fit_ridge <- glmnet(X_tr, y_tr, family = "binomial", alpha = 0, lambda = 500)
+
+cv_ridge <- cv.glmnet(X_tr, y_tr, family = "binomial", alpha = 0)
+
+plot(cv_ridge, cex.lab = 1.3)
+
+cv_ridge$lambda.1se
+
+fit_ridge <- glmnet(X_tr, y_tr, family = "binomial", alpha = 0, lambda = cv_ridge$lambda.1se)
+
+prob_ridge <- predict(fit_ridge, newx = X_teste, s = cv_ridge$lambda.1se, type = "response" )
+ 
+roc_ridge <- roc(Y_teste, prob_ridge)
+
+plot(roc_ridge, legacy.axes = TRUE)
+
+vip(fit_ridge)
+
+tab_AUC$AUC[tab_AUC$metodo == "ridge"] <- roc_ridge$auc
+tab_AUC
+```
+
+#lasso
+
+```{r}
+fit_lasso <- glmnet(X_tr, y_tr, family = "binomial", alpha = 1, lambda = 500)
+
+cv_lasso <- cv.glmnet(X_tr, y_tr, family = "binomial", alpha = 1)
+plot(cv_ridge, cex.lab = 1.3)
+
+fit_lasso <- glmnet(X_tr, y_tr, family = "binomial", alpha = 1, lambda = cv_lasso$lambda.1se)
+
+prob_lasso <- predict(fit_lasso, newx = X_teste, s = cv_lasso$lambda.1se, type = "response" )
+
+roc_lasso <- roc(Y_teste, prob_lasso)
+
+plot(roc_lasso, legacy.axes = TRUE)
+
+vip(fit_lasso, aesthetics = list(fill = "dark red"))
+
+tab_AUC$AUC[tab_AUC$metodo == "lasso"] <- roc_lasso$auc
+tab_AUC
+
+```
+
+#arvore
+
+```{r}
+arvore <- rpart(default ~., tr)
+
+arvore$cptable
+
+plotcp(arvore)
+
+arvore <- rpart(default ~., tr, control = rpart.control(cp = 0))
+
+rpart.plot(arvore)
+
+prob_arvore <- predict(arvore, teste, type = "prob")[,1]
+
+roc_arvore <- roc(Y_teste, prob_arvore)
+
+vip::vip(arvore, aesthetics = list(fill = "blue"))
+
+tab_AUC$AUC[tab_AUC$metodo == "árvore"] <- roc_arvore$auc
+tab_AUC
+```
+
+#Árvore de classificação Otimizada
+
+```{r}
+#função de teste dos hiperparâmetros
+arvore$cptable
+
+plotcp(arvore)
+
+#Otimização do modelo
+
+resultados <- crossing(minsplit = c(10, 20, 30, 40), 
+ min_buckets = c(seq(5, 50, 5)))
+ajuste <- function(minsplit, min_buckets) {
+ arvore <- rpart(default ~ ., data = tr, 
+                control = rpart.control(minsplit=minsplit,minbucket = min_buckets, cp = 0))
+ prob_arvore <- predict(arvore, teste, type = "prob")[,1]
+
+roc_arvore <- roc(Y_teste, prob_arvore)
+
+ return(roc_arvore$auc)
+}
+
+resultados <- resultados %>% 
+  mutate(erro = map2_dbl(minsplit, min_buckets, ajuste))
+
+head(resultados)
+
+resultados %>% 
+ mutate(minsplit = factor(minsplit)) %>% 
+ ggplot(aes(min_buckets, erro, group = minsplit, color = minsplit)) + 
+ geom_line( size = 1.2) +
+ labs(x = "Número de Árvores", y = "AUC (ROC)") +
+ theme_bw()
+
+#Resultados Finais
+
+arvore <- rpart(default ~ ., data = tr, 
+                control = rpart.control(minsplit=20,minbucket = 40, cp = 0))
+
+prob_arvore <- predict(arvore, teste, type = "prob")[,1]
+
+roc_arvore <- roc(Y_teste, prob_arvore)
+tab_AUC$AUC[tab_AUC$metodo == "árvore"] <- roc_arvore$auc
+tab_AUC
+```
+
+#random forest
+
+```{r}
+floresta <- ranger(default ~., data = tr)
+floresta
+
+floresta$confusion.matrix
+
+resultados <- tibble(n_arvores = c(1:15, seq(25, 500, 25)), 
+ erro = NA)
+
+resultados <- resultados %>% 
+ mutate(erro = map_dbl(n_arvores, ~ranger(default ~ ., num.trees = .x, 
+ data = tr)$prediction.error))
+resultados %>% 
+ ggplot(aes(n_arvores, erro)) + 
+ geom_line(color = "#5B5FFF", size = 1.2) + 
+ labs(x = "Número de Árvores", y = "Erro de Classificação (OOB)") + 
+ theme_bw()
+
+
+resultados <- crossing(mtry = c(4, 8, 15, 19), 
+ n_arvores = c(1, 5, 10, seq(25, 300, 50)))
+ajuste <- function(mtry, n_arvores) {
+ floresta <- ranger(default ~ ., num.trees = n_arvores, mtry = mtry, data = tr)
+ return(floresta$prediction.error)
+}
+resultados <- resultados %>% 
+ mutate(erro = map2_dbl(mtry, n_arvores, ajuste))
+head(resultados)
+
+
+resultados %>% 
+ mutate(mtry = factor(mtry)) %>% 
+ ggplot(aes(n_arvores, erro, group = mtry, color = mtry)) + 
+ geom_line( size = 1.2) +
+ labs(x = "Número de Árvores", y = "Erro de Classificação (OOB)") +
+ theme_bw()
+
+floresta <- ranger(default ~ ., num.trees = 250, mtry = 15, data = tr, probability = TRUE, importance = 'permutation')
+
+prob_floresta <- predict(floresta, data = teste)
+
+roc_floresta <- roc(teste$default, prob_floresta$predictions[,1])
+
+class(teste$default)
+
+head(prob_floresta$predictions)
+
+tab_AUC$AUC[tab_AUC$metodo == "forest"] <- roc_floresta$auc
+tab_AUC
+```
+
+#Técnicas de importânica de váriavel e interpretabilidade
+
+```{r}
+vip_floresta<-vip(floresta,aesthetics=list(fill="blue")) + ggtitle("Floresta")
+vip_floresta
+
+vip_arvore<-vip(arvore, aesthetics = list(fill = "green2")) + ggtitle("Arvore")
+
+vip_log <- vip(fit_log, aesthetics = list(fill = "gold")) + ggtitle("Logística")
+
+vip_ridge <- vip(fit_ridge) + ggtitle("Ridge")
+
+vip_lasso <- vip(fit_lasso, aesthetics = list(fill = "dark red")) + ggtitle("Lasso")
+
+grid.arrange(vip_log, vip_lasso, vip_ridge, vip_arvore, vip_floresta)
+
+# Pacote DALEX ----------------------------------------------------------
+
+library(DALEX)
+
+explicador <- explain(model = floresta, #objeto modelo
+                         data = dados, #base de teste - probabilidade
+                         y=dados$default #base de teste - var resposta
+                      )
+
+# PDP ----------------------------------------------------------
+
+pdp_rf <- model_profile(explainer = explicador, variables = c("sales_log", "fixed_assets_log","liq_assets_log"))
+pdp_rf
+
+plot(pdp_rf)
